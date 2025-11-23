@@ -6,11 +6,12 @@ import torch.nn as nn
 
 import copy
 import math
-
-from einops import repeat
+from sklearn.neighbors import NearestNeighbors
 from torch.autograd import Variable
 from torch.nn import Parameter
 import torch.nn.functional as F
+from torch_geometric.data import Data
+from einops import repeat
 
 '''
 This code is adapted from:
@@ -72,7 +73,7 @@ class Norm(nn.Module):
 
 #q, k, v:  B, heads, view, d_model/heads
 def attention(q, k, v, d_k, mask=None, src_mask=None, dropout=None):
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)  # scores shape is [bs heads view view]
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k * (torch.rand(1)+1))  # [views, heads, bs, bs]
     # k.transpose(-2, -1): B, heads, d_model/heads, view
 
     if src_mask is not None:
@@ -86,9 +87,13 @@ def attention(q, k, v, d_k, mask=None, src_mask=None, dropout=None):
             mask_all = mask.matmul(src_mask)
             scores = scores.masked_fill(mask_all == 0, -1e9)  # mask invalid view
         else:
-            src_mask = src_mask.unsqueeze(1).float()  # (bs, 1, view)
-            src_mask = src_mask.unsqueeze(-1).matmul(src_mask.unsqueeze(-2))  # mask shape is [bs 1 view view]
-            scores = scores.masked_fill(src_mask == 0, -1e9)  # mask invalid view
+            # src_mask = src_mask.unsqueeze(1).float()  # (bs, 1, view)
+            # src_mask = src_mask.unsqueeze(-1).matmul(src_mask.unsqueeze(-2))  # mask shape is [bs 1 view view]
+            # scores = scores.masked_fill(src_mask == 0, -1e9)  # mask invalid view
+
+            src_mask = torch.matmul(src_mask.float().t().unsqueeze(dim=-1), src_mask.float().t().unsqueeze(dim=1))  # instance-level attention [view n n]
+            # scores = scores.mul(src_mask.unsqueeze(1))
+            scores = scores.masked_fill(src_mask == 0, -1e9)
 
     scores = F.softmax(scores, dim=-1)
     # scores = scores.matmul(src_mask)
@@ -98,6 +103,64 @@ def attention(q, k, v, d_k, mask=None, src_mask=None, dropout=None):
     output = torch.matmul(scores, v)
     return output
 
+
+#跨视图和区域语义注意力
+class crs_attention(nn.Module):
+    def __init__(self, in_dim, label_embedd):
+        super(crs_attention, self).__init__()
+        self.layerQ = nn.Linear(label_embedd, in_dim)
+        # self.layerA = nn.Linear(in_dim, in_dim)
+        self.layerK = nn.Linear(in_dim, in_dim)
+        self.layerV = nn.Linear(in_dim, in_dim)
+        self.proj = nn.Linear(in_dim, in_dim)
+        self.proj_2 = nn.Linear(in_dim, in_dim)
+        self.proj_drop = nn.Dropout(p=0.1)
+        self.d_k = in_dim
+        self.initialize()
+
+    def initialize(self):
+        self.layerQ.reset_parameters()
+        # self.layerA.reset_parameters()
+        self.layerK.reset_parameters()
+        self.layerV.reset_parameters()
+
+    def forward(self, node_emb, label_emb, tau=0.5, src_mask=None):
+
+        Q = self.layerQ(label_emb)  # [128, 512]
+        K = self.layerK(node_emb)
+        V = self.layerV(node_emb)   # [128, 3, 512]
+        # Query = (Q.unsqueeze(1)).repeat(1, N_view, 1)
+        #基于标签语义的视图关注度
+        attn_1 = torch.matmul(Q.unsqueeze(1), K.transpose(-2, -1)) / math.sqrt(self.d_k)  # [128, 1, 3]   view-level attention
+        # attn_1_score = attn_1.masked_fill(src_mask.unsqueeze(1) == 0, -1e9)  # mask invalid view
+        mask = torch.tril(torch.ones_like(attn_1))
+        attn_1_score = attn_1.masked_fill(mask == 0, -1e9)
+
+        attn_1_weight = F.softmax(attn_1_score * tau, dim=-1)
+        # torch.save(attn_1_weight, './Visualize/attnMap.pt')
+        attn_1_weight = self.proj_drop(attn_1_weight)
+
+        # src_mask_2 = torch.matmul(src_mask.unsqueeze(-1), src_mask.unsqueeze(1))    # [128, 3, 3]
+        #视图间的相互关联
+        attn_2 = torch.matmul(K, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        mask_2 = torch.tril(torch.ones_like(attn_2))
+        # attn_2_score = attn_2.masked_fill(src_mask_2 == 0, -1e9)
+        attn_2_score = attn_2.masked_fill(mask_2 == 0, -1e9)
+        # 计算自注意力权重
+        attn_2_weight = F.softmax(attn_2_score * tau, dim=-1)
+        attn_2_weight = self.proj_drop(attn_2_weight)
+        attn_2_new = torch.matmul(attn_2_weight, V)
+
+        # NOTE: self-attn + cross-attn
+        # attn = attn_1_weight @ attn_2_new
+
+        attn = attn_1_weight @ V
+
+        attn = self.proj(attn)
+
+        return attn
+
+#计算输入特征（node_emb 和 label_emb）之间的关联关系，通过加权融合生成更具代表性的特征
 class linear_attention(nn.Module):
     def __init__(self, in_dim):
         super(linear_attention, self).__init__()
@@ -115,24 +178,23 @@ class linear_attention(nn.Module):
 
     def forward(self, node_emb, label_emb, tau=0.5, src_mask=None):
         # pdb.set_trace()
-        Q = self.layerQ(label_emb)  # [128, 3, 512]
+        Q = self.layerQ(label_emb)  # [128, 512]
         K = self.layerK(node_emb)
         V = self.layerV(node_emb)   # [128, 3, 512]
-        attention_score = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(node_emb.shape[-1]) # [128, 3, 3]
+        attention_score = torch.matmul(Q.unsqueeze(1), K.transpose(-2, -1)) / math.sqrt(node_emb.shape[-1]) # [128, 1, 3]
 
         # NOTE:注意mask的形状
-        # if src_mask is not None:
-        #     src_mask = src_mask.unsqueeze(1)
-        #     # src_mask = torch.matmul(src_mask.float().t().unsqueeze(-1), src_mask.float().t().unsqueeze(1))
-        #     src_mask = torch.matmul(src_mask.transpose(-2, -1), src_mask)
-        #     attention_score = attention_score.masked_fill(src_mask == 0, -1e9)  # mask invalid view
-
-        mask = torch.tril(torch.ones_like(attention_score))
-        attention_score = attention_score.masked_fill(mask == 0, -1e9)
+        if src_mask is not None:
+            src_mask = src_mask.unsqueeze(1)   # [128, 1, 3]
+            # src_mask = torch.matmul(src_mask.float().t().unsqueeze(-1), src_mask.float().t().unsqueeze(1))
+            # src_mask = torch.matmul(src_mask.transpose(-2, -1), src_mask)
+            attention_score = attention_score.masked_fill(src_mask == 0, -1e9)  # mask invalid view
 
         attention_weight = F.softmax(attention_score * tau, dim=-1)
+
         z = torch.matmul(self.proj_drop(attention_weight), V)
         z = self.proj(z)
+        #理想嵌入？？？
 
         return z
 
@@ -151,13 +213,12 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.out = nn.Linear(d_model, d_model)
 
-    def forward(self, k, v, src_mask=None):
-
+    def forward(self, k, v, src_mask=None, gt=None):
         bs = k.size(1)  # [view, bs, dmodel]
 
-        q = k
+        q = gt
         # perform linear operation and split into N heads
-        k = self.k_linear(k).view(-1, bs, self.h, self.d_k)  # [3, 128, 4, 64]
+        k = self.k_linear(k).view(-1, bs, self.h, self.d_k)  #  [3, 128, 4, 64]
         q = self.q_linear(q).view(-1, bs, self.h, self.d_k)
         v = self.v_linear(v).view(-1, bs, self.h, self.d_k)
 
@@ -169,27 +230,27 @@ class MultiHeadAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # [3, 4, 128, 128]
 
         # NOTE:注意mask的形状
-        src_mask = src_mask.float().t().unsqueeze(1)  # [3, 1, 128]
+        src_mask = src_mask.float().t().unsqueeze(1)    # [3, 1, 128]
         src_mask = torch.matmul(src_mask.unsqueeze(1), src_mask.unsqueeze(-1))  # [3, 1, 128, 128]
         # src_mask = src_mask.unsqueeze(-2)  # mask shape is [bs 1 1 view]
         scores = scores.masked_fill(src_mask == 0, -1e9)  # mask invalid view
-        scores = torch.matmul(scores, v)  # [3, 4, 128, 128] * [3, 4, 128, 64] --> [3, 4, 128, 64]
+        scores = torch.matmul(scores, v)    # [3, 4, 128, 128] * [3, 4, 128, 64] --> [3, 4, 128, 64]
 
+        # calculate attention using function we will define next
+        # concatenate heads and put through final linear layer
 
         scores = F.softmax(scores, dim=-1)  # [3, 4, 128, 64]
         concat = scores.transpose(1, 2).contiguous() \
-            .view(-1, bs, self.d_model)  # [3, 128, 4, 64]
+            .view(-1, bs, self.d_model)     # [3, 128, 4, 64]
 
         output = self.out(concat)
 
         return output
 
-
 class LinearAttention(nn.Module):
     def __init__(self, d_model, key_dim, attn_ratio=4):
         super().__init__()
         self.scale = key_dim ** -0.5
-        self.scale = d_model ** -0.5
         self.key_dim = key_dim
         self.d = int(attn_ratio * key_dim)
         self.attn_ratio = attn_ratio
@@ -198,11 +259,6 @@ class LinearAttention(nn.Module):
         self.key_proj = nn.Linear(d_model, key_dim)
         self.value_proj = nn.Linear(d_model, self.d)
         self.proj = nn.Linear(self.d, d_model)
-
-        # self.query_proj = nn.Linear(d_model, d_model)
-        # self.key_proj = nn.Linear(d_model, d_model)
-        # self.value_proj = nn.Linear(d_model, d_model)
-        # self.proj = nn.Linear(d_model, d_model)
 
     def forward(self, query, key_value):
         B, L, D = query.shape
@@ -216,29 +272,24 @@ class LinearAttention(nn.Module):
         out = self.proj(out)  # B, L, d_model
         return out
 
-
 class CascadedAttention(nn.Module):
     def __init__(self, d_model, key_dim, attn_ratio=4, num_modalities=3):
         super().__init__()
         self.layers = nn.ModuleList([LinearAttention(d_model, key_dim, attn_ratio) for _ in range(num_modalities - 1)])
-        self.proj = nn.Linear(d_model, d_model)
 
     def forward(self, x):  # x1 (B, num_modalities, d_model)
         B, num_modalities, D = x.shape
-        query = x[:, 0, :].unsqueeze(1)
-        attn_out = []
-        for i in range(num_modalities-1):
-            if i > 0:
-                query = x[:, i, :].unsqueeze(1) + query  # Initial query from modality 0
-            key_value = x[:, i+1, :].unsqueeze(1)
-            query = self.layers[i](query, key_value)
-            attn_out.append(query)
-        x = query
-        # x1 = self.proj(torch.concatenate(attn_out, dim=1))
-        return x
+        query = x[:, 0, :].unsqueeze(1)  # Initial query from modality 0
+
+        for i in range(1, num_modalities):
+            key_value = x[:, i, :].unsqueeze(1)
+            query = self.layers[i - 1](query, key_value)
+
+        return query.squeeze(1)
+
 
 class FeedForward(nn.Module):
-    def __init__(self, d_model, d_ff=2048, dropout=0.2):
+    def __init__(self, d_model, d_ff=2048, dropout=0.):
         super().__init__()
 
         # We set d_ff as a default to 2048
@@ -280,85 +331,66 @@ class GLU_FFN(nn.Module):
         x = self.layernorm(x + residual)
         return x
 
+
 class EncoderLayer(nn.Module):
-    def __init__(self, d_model, heads, view_num, dropout=0.1):
+    def __init__(self, d_model, label_embedd, heads, view_num, dropout=0.1):
         super().__init__()
         # self.norm_1 = Norm(d_model)
-        # self.norm_2 = Norm(d_model)
-        self.norm_1 = nn.LayerNorm([view_num, d_model])
-        self.norm_2 = nn.LayerNorm([view_num, d_model])
-        # self.attn = MultiHeadAttention(heads, d_model, dropout=dropout)
-        self.label_attentive = linear_attention(d_model)
-        self.cascade = CascadedAttention(d_model, 64, 4, view_num)
+        # self.norm_3 = Norm(d_model)
+        # self.norm_1 = nn.LayerNorm([view_num, d_model])
+        # self.norm_2 = nn.LayerNorm([view_num, d_model])
+        self.norm_1 = Norm(d_model)
+        self.norm_2 = Norm(d_model)
 
+        self.label_attentive = crs_attention(d_model, label_embedd)
+        # self.label_attentive = linear_attention(d_model)
+        # self.cascade = CascadedAttention(d_model, 64, 4, view_num)
         self.ff = FeedForward(d_model, dropout=0.2)
-        # self.ff = Mlp(in_dim=d_model, mlp_dim=int(d_model), out_dim=d_model, dropout_rate=dropout)
+        # self.ff = Mlp(in_dim=d_model, mlp_dim=int(d_model), out_dim=d_model, dropout_rate=0.2)
         # self.ff = GLU_FFN(input_dim=d_model, hidden_dim=d_model * 4)
-
         self.dropout_1 = nn.Dropout(dropout)
         self.dropout_2 = nn.Dropout(dropout)
 
-    def forward(self, x, tau, src_mask):
-        x2 = self.norm_1(x)
-        # x1 = x1 + self.dropout_1(self.label_attentive(x2, x2, src_mask))   # x2: [B, view, dim]
-        # x1 = x1 + self.dropout_1(self.attn(x2, x2, src_mask))
-        attn = self.dropout_1(self.label_attentive(x2, x2, tau, src_mask))
-        # attn = self.dropout_1(self.cascade(x2))
-        x = x + attn    # attention 后输出的形状为[bs, d_model]
+    def forward(self, x, gt, tau, src_mask):
+
+        x_norm = self.norm_1(x)     # [bs, view, dim]
+        # x1 = self.cascade(x_norm) # [128, 512]
+        # label_attentive 是一个cross-attention；输入是multi-view embedding和label embedding
+        lb_mv = self.dropout_1(self.label_attentive(x, gt, tau, src_mask))
+        # x1 = x1 + self.dropout_1(lb_mv)
+        x = x_norm + lb_mv
         x2 = self.norm_2(x)
-        x = x + self.dropout_2(self.ff(x2))
-        return x
+        x_new = x + self.dropout_2(self.ff(x2))
+
+        return x_new
 
 
 class Encoder(nn.Module):
-    def __init__(self, d_model, N, heads, view_num, dropout):
+    def __init__(self, d_model, label_embedd, N, heads, dropout, view_num):
         super().__init__()
         self.N = N
 
         # self.pe = PositionalEncoder(d_model, dropout=dropout)
-        self.layers = get_clones(EncoderLayer(d_model, heads, view_num, dropout), N)
+        self.layers = get_clones(EncoderLayer(d_model, label_embedd, heads, view_num, dropout), N)
         self.norm = Norm(d_model)
+        # self.norm = nn.LayerNorm([view_num, d_model])
 
-    def forward(self, src, tau, src_mask):
+    def forward(self, src, gt, tau, src_mask):
         x = src
         # x1 = self.embed(src)
         # x1 = self.pe(x1)
         for i in range(self.N):
-            x = self.layers[i](x, tau, src_mask)
+            x = self.layers[i](x, gt, tau, src_mask)
         return self.norm(x)
 
 
-class Multi_Encoder(nn.Module):
-    def __init__(self, d_list, d_out, hidden_layers=3, hidden_dim=128, dropout_rate=0.1):
-        super(Multi_Encoder, self).__init__()
-        layers = []
-
-        for d in d_list:
-            layer = []
-            in_dim = d
-            for _ in range(hidden_layers):
-                layer.append(nn.Linear(in_dim, hidden_dim))
-                layer.append(nn.ReLU())
-                layer.append(nn.Dropout(dropout_rate))
-                in_dim = hidden_dim
-            layer.append(nn.Linear(hidden_dim, d_out))
-            layers.append(nn.Sequential(*layer))
-
-        self.layers = nn.ModuleList(layers)
-
-    def forward(self, x):
-        # 假设x是一个列表，包含多个张量，每个张量需要通过一个不同的编码器
-        outputs = [layer(x_i) for layer, x_i in zip(self.layers, x)]
-        return outputs
-
-
 class Transformer(nn.Module):
-    def __init__(self, d_model, N, heads, view_num, dropout):
+    def __init__(self, d_model, label_embedd, N, heads, dropout, view_num):
         super().__init__()
-        self.encoder = Encoder(d_model, N, heads, view_num, dropout)
+        self.encoder = Encoder(d_model, label_embedd, N, heads, dropout, view_num)
 
-    def forward(self, src, tau, src_mask):
-        e_outputs = self.encoder(src, tau, src_mask)
+    def forward(self, src, gt, tau, src_mask):
+        e_outputs = self.encoder(src, gt, tau, src_mask)
 
         return e_outputs
 
@@ -372,6 +404,7 @@ class Transformer(nn.Module):
 #
 #     def forward(self, x1):
 #         return self.fc(x1)
+
 class Classifier(nn.Module):
     def __init__(self, nhid, nclass, dropout=0., with_bn=True, with_bias=True):
         super(Classifier, self).__init__()
@@ -391,7 +424,7 @@ class Classifier(nn.Module):
         self.bn1.reset_parameters()
 
     def forward(self, x):
-        x = self.layer1(x)
+        x =self.layer1(x)
         x = self.bn1(x)
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
@@ -400,35 +433,79 @@ class Classifier(nn.Module):
         # return F.log_softmax(x1, dim=1)
         return x
 
-class PositionalEncoder(nn.Module):
-    def __init__(self, d_model, max_seq_len=200, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.dropout = nn.Dropout(dropout)
-        # create constant 'pe' matrix with values dependant on
-        # pos and i
-        pe = torch.zeros(max_seq_len, d_model)
-        for pos in range(max_seq_len):
-            for i in range(0, d_model, 2):
-                pe[pos, i] = \
-                    math.sin(pos / (10000 ** ((2 * i) / d_model)))
-                pe[pos, i + 1] = \
-                    math.cos(pos / (10000 ** ((2 * (i + 1)) / d_model)))
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+class LabelEncoder(nn.Module):
+    def __init__(self, nhid, nclass, nlayers=3, dropout=0.5, with_bn=True, with_bias=True):
+        super(LabelEncoder, self).__init__()
+        self.with_bn = with_bn
+        self.layers = nn.ModuleList()
+        self.dropout = dropout
 
-    def forward(self, x):
-        # make embeddings relatively larger
-        x = x * math.sqrt(self.d_model)
-        # add constant to embedding
-        seq_len = x.size(1)
-        pe = Parameter(self.pe[:, :seq_len])
-        if x.is_cuda:
-            pe.cuda()
-        x = x + pe
-        return self.dropout(x)
+        # 1. 第一层：将原始标签维度（nclass）映射到隐藏层维度（nhid）
+        self.layers.append(nn.Linear(nclass, nhid, bias=with_bias))
+        if with_bn:
+            self.bns = nn.ModuleList()
+            self.bns.append(nn.BatchNorm1d(nhid))
+
+        # 2. 中间层：隐藏层内部的变换（默认layers=3，中间层数量为1）
+        for i in range(nlayers - 2):
+            self.layers.append(nn.Linear(nhid, nhid, bias=with_bias))
+            self.bns.append(nn.BatchNorm1d(nhid))
+         # 3. 最后一层：输出仍为nhid维度（保持编码后的维度一致性）
+        self.layers.append(nn.Linear(nhid, nhid, bias=with_bias))
+
+        self.initialize()
+
+    def initialize(self):
+        for m in self.layers:
+            m.reset_parameters()
+        if self.with_bn:
+            for m in self.bns:
+                m.reset_parameters()
+
+    def forward(self, y):
+        # pdb.set_trace()
+        for ii, layer in enumerate(self.layers):
+            # 最后一层：直接输出，不经过激活和Dropout,目的是保留编码后的向量在连续空间中的分布特性，便于后续计算（如与视图特征的注意力交互）
+            if ii == len(self.layers) - 1:
+                return layer(y)
+            y = layer(y)
+            if self.with_bn:
+                y = self.bns[ii](y)
+
+            y = F.relu(y)
+            y = F.dropout(y, p=self.dropout, training=self.training)
+
+
+# class PositionalEncoder(nn.Module):
+#     def __init__(self, d_model, max_seq_len=200, dropout=0.1):
+#         super().__init__()
+#         self.d_model = d_model
+#         self.dropout = nn.Dropout(dropout)
+#         # create constant 'pe' matrix with values dependant on
+#         # pos and i
+#         pe = torch.zeros(max_seq_len, d_model)
+#         for pos in range(max_seq_len):
+#             for i in range(0, d_model, 2):
+#                 pe[pos, i] = \
+#                     math.sin(pos / (10000 ** ((2 * i) / d_model)))
+#                 pe[pos, i + 1] = \
+#                     math.cos(pos / (10000 ** ((2 * (i + 1)) / d_model)))
+#         pe = pe.unsqueeze(0)
+#         self.register_buffer('pe', pe)
+#
+#     def forward(self, x1):
+#         # make embeddings relatively larger
+#         x1 = x1 * math.sqrt(self.d_model)
+#         # add constant to embedding
+#         seq_len = x1.size(1)
+#         pe = Parameter(self.pe[:, :seq_len])
+#         if x1.is_cuda:
+#             pe.cuda()
+#         x1 = x1 + pe
+#         return self.dropout(x1)
+
 class Model(nn.Module):
-    def __init__(self, d_list,
+    def __init__(self, d_list, label_embedd,
                  d_model, n_layers, heads,
                  class_num, tau,
                  dropout,
@@ -436,54 +513,57 @@ class Model(nn.Module):
 
         super().__init__()
         self.class_num = class_num
+        self.d_model = d_model
         self.view_num = len(d_list)
-        self.ETrans = Transformer(d_model, n_layers, heads, self.view_num, dropout)
+        self.ETrans = Transformer(d_model, label_embedd, n_layers, heads, dropout, self.view_num)
         self.embeddinglayers = setEmbedingModel(d_list, d_model)  # embedding
-        self.Classifier = Classifier(d_model, class_num)
-        self.linear = nn.Linear(d_model, class_num)
-        self.PositionalEncoder = PositionalEncoder(d_model, self.view_num + 1)
-        self.MultiEncoder = Multi_Encoder(d_list, d_model, 3, 256, 0.)
-        self.attn = linear_attention(d_model)
-        self.norm_1 = nn.LayerNorm([self.view_num+1, d_model])
-        self.norm_2 = nn.LayerNorm([self.view_num+1, d_model])
-        self.dropout_1 = nn.Dropout(dropout)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-        self.to_latent = nn.Identity()
+        self.Classifier = Classifier(d_model, class_num, dropout=0.)
+        # self.linear = nn.Linear(class_num, d_model)
+        self.LabelEncoder = LabelEncoder(label_embedd, class_num)
+        # self.Norm = Norm(d_model)
+        # self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+        # self.to_latent = nn.Identity()
         self.tau = tau
+        # self.MLP_list = nn.ModuleList([MLP(dim_pre_view, hidden_features, hidden_list,
+        #                                    batchNorm, nonlinearity, negative_slope) for dim_pre_view in d_list])
+        # self.reset_parameters()
 
-    def forward(self, x, src_mask=None):    # gt: [Bs, n_classes]
+    # def reset_parameters(self):
+    #     for module in self.MLP_list:
+    #         module.reset_parameters()
+    #     nn.init.kaiming_uniform_(self.NN2.weight, nonlinearity='sigmoid')
+    #     nn.init.constant_(self.NN2.bias, 0.0)
+
+    def forward(self, x, gt, src_mask, save=False):    # gt: [Bs, n_classes]
+        # x1 = Add_noise(x1, src_mask, 0.5, noise_type='gaussian')
         for v in range(self.view_num):  # encode input view to features with same dimension
             x[v] = self.embeddinglayers[v](x[v])
-        # x1 = self.MultiEncoder(x1)    # list
+
         x = torch.stack(x, dim=1)  # B,view,dim
+        # b, n, _ = x1.shape
+        # Mask missing view
+        # x1 = x1.mul(src_mask.unsqueeze(2))
+        # x1.masked_fill(x1 == 0, -1e9)
         # x1 = self.PositionalEncoder(x1)
-        b, n, _ = x.shape
-        # cls_tokens = repeat(self.cls_token, '() n d->b n d', b=b)
+        # cls_tokens = repeat(self.cls_token, '() n d->b n d', b = b)
         # x1 = torch.cat((cls_tokens, x1), dim=1)
 
-        x = self.ETrans(x, self.tau, src_mask)  # mask/src_mask: [B, view]
-
-        # step2: linear attention
-        # x2 = self.norm_1(x1)
-        # x1 = x1 + self.dropout_1(self.attn(x2, x2, src_mask))  # x2: [B, view, dim]
-        # # x1 = x1 + self.dropout_1(self.attn(x2, x2, src_mask))
-        # x1 = self.norm_2(x1)
-        # EncX = x1
+        gtEmbed = self.LabelEncoder(gt)   # Bs, d_model
+        x = self.ETrans(x, gtEmbed, self.tau, src_mask)  # mask/src_mask: [B, view]
+            # [128, 3, 512]
 
         # feature fusion
         # x1 = x1.mul(src_mask.unsqueeze(-1))
-        # x_new = x1.reshape(b, -1)
-        # print(x_new.shape)
+        # 特征聚合（通过爱因斯坦求和与加权平均处理缺失视图）
+        x = torch.einsum('bvd->bd', x)# 合并视图维度，得到[batch_size, d_model]
+        wei = 1 / torch.sum(src_mask, 1)# 计算视图权重（处理缺失
+        x = torch.diag(wei).mm(x)# 加权聚合特征
         x = torch.einsum('bvd->bd', x)
         wei = 1 / torch.sum(src_mask, 1)
         x = torch.diag(wei).mm(x)
         EncX = x
-
         # x1 = x1[:, 0]
         # x1 = self.to_latent(x1)
-
-        # EncX = x1
-        output = self.Classifier(x)
 
         # add evidence
         # evidence = F.softplus(self.Classifier(x1))
@@ -491,9 +571,15 @@ class Model(nn.Module):
         # S = torch.sum(alpha, dim=1, keepdim=True)
         # u = self.class_num / S
 
-        return output, EncX   # alpha, uncertainty, feature_map
+        # 分类输出
+        output = self.Classifier(x)# 生成类别预测分数（Logits）
+        output = self.Classifier(x)
 
-def S_model(d_list,
+        #返回融合后的深层特征 fused_feat，用于蒸馏给学生。
+        return output, EncX, gtEmbed
+
+def T_model(  d_list,
+              label_embedd=64,
               d_model=768,
               n_layers=2, heads=4, classes_num=10, tau=0.5, dropout=0.2,
               load_weights=None,
@@ -505,7 +591,8 @@ def S_model(d_list,
     assert d_model % heads == 0
     assert dropout < 1
 
-    model = Model(d_list, d_model, n_layers, heads, classes_num, tau, dropout)
+    # 实例化Model类
+    model = Model(d_list, label_embedd, d_model, n_layers, heads, classes_num, tau, dropout)
 
     if load_weights is not None:
         print("loading pretrained weights...")
@@ -515,5 +602,12 @@ def S_model(d_list,
                 nn.init.xavier_uniform_(p)
 
     model = model.to(device)
+
+
+    return model
+
+    return model
+    model = model.to(device)
+
 
     return model
